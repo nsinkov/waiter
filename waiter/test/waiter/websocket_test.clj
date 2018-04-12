@@ -368,7 +368,7 @@
                           (async/>! out :data)
                           {:status 200}))
                       wrap-ws-close-on-error)
-          {:keys [status] :as response} (async/<!! (handler request))]
+          {:keys [status]} (async/<!! (handler request))]
       ;; response should indicate an internal server error
       (is (= 200 status))
       ;; channels should contain data and not be closed
