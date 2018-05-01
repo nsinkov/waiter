@@ -9,8 +9,7 @@
 ;;       actual or intended publication of such source code.
 ;;
 (ns waiter.process-request
-  (:require [clj-time.core :as t]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.tools.logging :as log]
@@ -22,6 +21,7 @@
             [metrics.timers :as timers]
             [qbits.jet.client.http :as http]
             [qbits.jet.servlet :as servlet]
+            [ring.util.codec :as ring-codec]
             [slingshot.slingshot :refer [try+]]
             [try-let :refer [try-let]]
             [waiter.async-request :as async-req]
@@ -41,10 +41,10 @@
             [waiter.util.ring-utils :as ru]
             [waiter.util.utils :as utils])
   (:import (java.io InputStream IOException)
-           java.util.concurrent.TimeoutException
-           org.eclipse.jetty.io.EofException
-           (org.eclipse.jetty.server HttpChannel HttpOutput)
-           (org.joda.time DateTime)))
+           (java.util.concurrent TimeoutException)
+           (org.eclipse.jetty.client HttpClient)
+           (org.eclipse.jetty.io EofException)
+           (org.eclipse.jetty.server HttpChannel HttpOutput)))
 
 (defn check-control [control-chan]
   (let [state (au/poll! control-chan :still-running)]
@@ -168,11 +168,10 @@
 
 (defn request->endpoint
   "Retrieves the relative url Waiter should use to forward requests to service instances."
-  [{:keys [query-string uri]} waiter-headers]
+  [{:keys [uri]} waiter-headers]
   (if (= "/secrun" uri)
     (headers/get-waiter-header waiter-headers "endpoint-path" "/req")
-    (cond-> uri
-            (not (str/blank? query-string)) (str "?" query-string))))
+    uri))
 
 (defn- handle-response-error
   "Handles error responses from the backend."
@@ -189,39 +188,16 @@
     (-> (ex-info message (assoc metrics-map :status status) error)
         (utils/exception->response request))))
 
-(defn http-method-fn
-  "Retrieves the qbits.jet.client.http client function that corresponds to the http method."
-  [request-method]
-  (let [default-http-method http/post
-        http-method-helper (fn http-method-helper [http-method]
-                             (fn inner-http-method-helper [client url request-map]
-                               (http/request client (into {:method http-method :url url} request-map))))]
-    (case request-method
-      :copy (http-method-helper :copy)
-      :delete http/delete
-      :get http/get
-      :head http/head
-      :move (http-method-helper :move)
-      :patch (http-method-helper :patch)
-      :post http/post
-      :put http/put
-      :trace http/trace
-      default-http-method)))
-
-(defn request->http-method-fn
-  "Retrieves the qbits.jet.client.http client function that corresponds to the http method used in the request."
-  [{:keys [request-method]}]
-  (http-method-fn request-method))
-
-(defn make-http-request
+(defn- make-http-request
   "Makes an asynchronous request to the endpoint using Basic authentication."
-  [http-client make-basic-auth-fn request-method endpoint headers body app-password {:keys [username principal]}
-   idle-timeout output-buffer-size]
+  [^HttpClient http-client make-basic-auth-fn request-method endpoint query-string headers body app-password
+   {:keys [username principal]} idle-timeout output-buffer-size]
   (let [auth (make-basic-auth-fn endpoint "waiter" app-password)
         headers (headers/assoc-auth-headers headers username principal)
-        http-method (http-method-fn request-method)]
-    (http-method
-      http-client endpoint
+        query-params (when-not (str/blank? query-string)
+                       (ring-codec/form-decode query-string))]
+    (http/request
+      http-client
       {:as :bytes
        :auth auth
        :body body
@@ -229,11 +205,14 @@
        :fold-chunked-response? true
        :fold-chunked-response-buffer-size output-buffer-size
        :follow-redirects? false
-       :idle-timeout idle-timeout})))
+       :idle-timeout idle-timeout
+       :method request-method
+       :query-string query-params
+       :url endpoint})))
 
 (defn make-request
   "Makes an asynchronous http request to the instance endpoint and returns a channel."
-  [http-client make-basic-auth-fn service-id->password-fn instance {:keys [body request-method] :as request}
+  [http-client make-basic-auth-fn service-id->password-fn instance {:keys [body query-string request-method] :as request}
    {:keys [initial-socket-timeout-ms output-buffer-size]} passthrough-headers end-route metric-group]
   (let [instance-endpoint (scheduler/end-point-url instance end-route)
         service-id (scheduler/instance->service-id instance)
@@ -258,15 +237,23 @@
         (log/error e "Unable to track content-length on request")))
     (when waiter-debug-enabled?
       (log/info "connecting to" instance-endpoint))
-    (make-http-request http-client make-basic-auth-fn request-method instance-endpoint headers body service-password
-                       (handler/make-auth-user-map request) initial-socket-timeout-ms output-buffer-size)))
+    (make-http-request
+      http-client make-basic-auth-fn request-method instance-endpoint query-string headers body service-password
+      (handler/make-auth-user-map request) initial-socket-timeout-ms output-buffer-size)))
+
+(defn- append-query-string
+  "Appends the query string (when not blank) to the endpoint."
+  [endpoint query-string]
+  (cond-> endpoint
+          (not (str/blank? query-string)) (str "?" query-string)))
 
 (defn inspect-for-202-async-request-response
   "Helper function that inspects the response and triggers async-request post processing."
   [{:keys [headers status] :as response} post-process-async-request-response-fn instance-request-properties
-   service-id metric-group instance endpoint request reason-map reservation-status-promise]
+   service-id metric-group instance endpoint {:keys [query-string] :as request} reason-map reservation-status-promise]
   (let [location-header (str (get headers "location"))
-        location (async-req/normalize-location-header endpoint location-header)]
+        instance-endpoint (append-query-string endpoint query-string)
+        location (async-req/normalize-location-header instance-endpoint location-header)]
     (if (= status 202)
       (if (str/starts-with? location "/")
         (do

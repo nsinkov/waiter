@@ -31,36 +31,6 @@
   [resource request-method & params]
   {:request-method request-method :uri resource :params (first params)})
 
-(deftest test-http-request-method-get
-  (testing "Test request method: get"
-    (let [dummy-request (request "/run" :get {:a 1 :b 2})]
-      (is (= http/get
-             (request->http-method-fn dummy-request))))))
-
-(deftest test-http-request-method-post
-  (testing "Test request method: post"
-    (let [dummy-request (request "/run" :post {:a 1 :b 2})]
-      (is (= http/post
-             (request->http-method-fn dummy-request))))))
-
-(deftest test-http-request-method-put
-  (testing "Test request method: put"
-    (let [dummy-request (request "/run" :put {:a 1 :b 2})]
-      (is (= http/put
-             (request->http-method-fn dummy-request))))))
-
-(deftest test-http-request-method-delete
-  (testing "Test request method: delete"
-    (let [dummy-request (request "/run" :delete {:a 1 :b 2})]
-      (is (= http/delete
-             (request->http-method-fn dummy-request))))))
-
-(deftest test-http-request-method-head
-  (testing "Test request method: head"
-    (let [dummy-request (request "/run" :head {:a 1 :b 2})]
-      (is (= http/head
-             (request->http-method-fn dummy-request))))))
-
 (deftest test-request->endpoint-without-headers
   (let [legacy-endpoints #{"/secrun"}
         passthrough-endpoints #{"/foo" "/baz/bar" "/load/balancer" "/auto/scale/1/2/3"}
@@ -95,7 +65,7 @@
     (doseq [item test-endpoints]
       (testing (str "Test retrieve endpoint with headers and query string: " item)
         (let [dummy-request (assoc (request item :post {:a 1 :b 2}) :query-string "foo=bar&baz=1234")
-              expected-endpoint (if (contains? legacy-endpoints item) custom-legacy-endpoint (str item "?foo=bar&baz=1234"))]
+              expected-endpoint (if (contains? legacy-endpoints item) custom-legacy-endpoint item)]
           (is (= expected-endpoint
                  (request->endpoint dummy-request waiter-headers))))))))
 
@@ -402,21 +372,20 @@
                                       app-password)
             http-client (http/client)
             request-method-fn-call-counter (atom 0)]
-        (with-redefs [http-method-fn
-                      (fn [_]
-                        (fn [^HttpClient _ endpoint request-config]
-                          (swap! request-method-fn-call-counter inc)
-                          (is (= expected-endpoint endpoint))
-                          (is (= :bytes (:as request-config)))
-                          (is (:auth request-config))
-                          (is (= "body" (:body request-config)))
-                          (is (= 654321 (:idle-timeout request-config)))
-                          (is (= (-> (dissoc passthrough-headers "expect" "authorization"
-                                             "connection" "keep-alive" "proxy-authenticate" "proxy-authorization"
-                                             "te" "trailers" "transfer-encoding" "upgrade")
-                                     (merge {"x-waiter-auth-principal" "test-user"
-                                             "x-waiter-authenticated-principal" "test-user@test.com"}))
-                                 (:headers request-config)))))]
+        (with-redefs [http/request
+                      (fn [^HttpClient _ request-config]
+                        (swap! request-method-fn-call-counter inc)
+                        (is (= expected-endpoint (:url request-config)))
+                        (is (= :bytes (:as request-config)))
+                        (is (:auth request-config))
+                        (is (= "body" (:body request-config)))
+                        (is (= 654321 (:idle-timeout request-config)))
+                        (is (= (-> (dissoc passthrough-headers "expect" "authorization"
+                                           "connection" "keep-alive" "proxy-authenticate" "proxy-authorization"
+                                           "te" "trailers" "transfer-encoding" "upgrade")
+                                   (merge {"x-waiter-auth-principal" "test-user"
+                                           "x-waiter-authenticated-principal" "test-user@test.com"}))
+                               (:headers request-config))))]
           (make-request http-client make-basic-auth-fn service-id->password-fn instance request request-properties passthrough-headers end-route nil)
           (is (= 1 @request-method-fn-call-counter)))))))
 
@@ -516,7 +485,7 @@
     (let [handler (-> (fn [_] {:status 200})
                       wrap-suspended-service)
           request {}
-          {:keys [status body]} (handler request)]
+          {:keys [status]} (handler request)]
       (is (= 200 status)))))
 
 (deftest test-wrap-too-many-requests
@@ -542,7 +511,7 @@
                         wrap-too-many-requests)
             request {:descriptor {:service-id service-id
                                   :service-description {"max-queue-length" 10}}}
-            {:keys [status body]} (handler request)]
+            {:keys [status]} (handler request)]
         (is (= 200 status))))))
 
 (deftest test-missing-run-as-user?
